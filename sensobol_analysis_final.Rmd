@@ -1,0 +1,432 @@
+---
+title: "CYVD Model -- Sensitivity Analysis"
+author: "SYM"
+date: "2/22/2022"
+output:
+  html_document:
+    self_contained: no
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objectives/Introduction
+This model tracks a population of squash bugs that vary in their symbiont and pathogen infection status in a field over the course of a single squash growing season. We specifically look at how varying traits impacted by symbiont status affects pathogen transmission. 
+Objectives: 
+Identify whether vector traits influenced by symbiont status are important in determining plant infection dynamics.
+
+Identify the role of aposymbiotic bugs in propagating transmission and determine whether symbiont prevalence has an effect. 
+
+This script runs the updated CYVD model and global sensitivity analysis on 3 parameters of interest:
+apo bug clearance rate, apo bug transmission rate, and probability of symbiont acquisition (symbiont prevalence).
+
+## Model and justification
+A model diagram with equations can be found in our paper in Ecological Modelling (doi XXXXXXX). All equations and state variables are also available in the C file. 
+
+## Data source(s)
+Our model makes use of data that are already published and publicly available. All relevant citations can be found in Table 1 of our paper.
+
+Data sets utilized for this research are as follows: 
+Data on insect maturation rates: https://doi.org/10.3389/fmicb.2021.719112 
+Acevedo, T. S., G. P. Fricker, J. R. Garcia, T. Alcaide, A. Berasategui, K. S. Stoy, and N. M. Gerardo. 2021. The Importance of Environmentally Acquired Bacterial Symbionts for the Squash Bug (Anasa tristis), a Significant Agricultural Pest. Frontiers in Microbiology 12:719112.
+Data on overwintering adults: https://shareok.org/handle/11244/300885?show=full 
+Eiben, J. A. 2004. Characterizing the Overwintering and Emergence Behaviors of the Adult Squash Bug, Anasa tristis (Degeer). Albright College.
+Data on insect survival:  https://www.proquest.com/docview/303565822/abstract/B46754349D354E12PQ/1 
+Fielding, D. J. 1988. Phenology and population dynamics of the squash bug, Anasa tristis . Ph.D., University of Illinois at Urbana-Champaign, United States -- Illinois.
+Data on impact of symbiont status on insect vector traits: https://doi.org/10.1128/AEM.01550-21  
+Mendiola, S. Y., K. S. Stoy, S. DiSalvo, C. L. Wynn, D. J. Civitello, and N. M. Gerardo. 2022. Competitive Exclusion of Phytopathogenic Serratia marcescens from Squash Bug Vectors by the Gut Endosymbiont  Caballeronia . Applied and Environmental Microbiology 88:e01550-21.
+Data on adult insect reproduction: https://doi.org/10.1007/s10682-021-10120-1
+Villa, S. M., D. D. Han, M. E. Jordan, and N. M. Gerardo. 2021. The resilience of reproductive interference. Evolutionary Ecology 35:537–553.
+ 
+## Scripts
+```{r load required packages}
+library(ggplot2)
+library(cowplot)
+theme_set(theme_cowplot()) # Makes the ggplot look nicer (says Dave)
+library(tidyverse)
+library(tidyr)
+library(patchwork)
+library(dplyr)
+library(deSolve)
+library(caTools) #this package is for AUC calculations
+library(sensobol)
+library(data.table)
+library(foreach)
+library(parallel)
+library(doParallel)
+
+```
+
+##Load model and compile from C
+```{r load_model}
+# compile model from C definition
+try(dyn.unload("C:/Users/sandr/Dropbox/squash_bug_model/Squash_bug_apographs3.dll")) # unLoad dll
+system("R CMD SHLIB C:/Users/sandr/Dropbox/squash_bug_model/Squash_bug_apographs3.c")
+dyn.load("C:/Users/sandr/Dropbox/squash_bug_model/Squash_bug_apographs3.dll") # load dll
+
+```
+## Model setup
+```{r set up model}
+#### low transmission ####
+Inits = c(OA = 9, E = 0, L1 = 0, L2 = 0, L3 = 0, L4 = 0, L5 = 0, A = 0, L2o = 0, L3o = 0, L4o = 0, L5o = 0, Ao = 0, L2I = 0, L3I = 0, L4I = 0, L5I = 0, AI = 0, L2oI = 0, L3oI = 0, L4oI = 0, L5oI = 0, AoI = 0, P_I = 0, Apo_PI = 0, Sym_PI = 0, AO_PI = 0, OAI = 1)
+pars_low = c(d_A = 1/60, l = 0.05, b = 10, K_E = 250, 
+         d_E = 1/7, m_E = 1/7, # Development rates are rough estimates from Acevedo et al
+         d_1 = 1/4, m_1 = 1/4, # Mortality rates just correspond to 50% survival through the stages
+         d_2 = 1/4, m_2 = 1/4,
+         d_3 = 1/4, m_3 = 1/4,
+         d_4 = 1/4, m_4 = 1/4,
+         d_5 = 1/16, m_5 = 1/16,
+         
+         p = 0.9, #set this anywhere between .9 to 1, we will vary the range later
+         d_2o = 1/4, m_2o = 1/4,
+         d_3o = 1/7, m_3o = 1/7,
+         d_4o = 1/13, m_4o = 1/13,
+         d_5o = 1/17, m_5o = 1/17,
+         d_Ao = 1/60,
+         
+         c = 1/3, B_pb = 0.025,
+         c_o = 1/10, B_bp = 0.01,
+         B_o = 10, P0 = 1
+         )
+timespan = 180:270 #field season by Julian date
+
+sim1 = lsoda(y = Inits, times=timespan, parms = pars_low, func="derivs", dllname = "Squash_bug_apographs3", initfunc="initmod")
+```
+
+```{r plot population dynamics}
+#create a data frame from simulation output for graphing 
+
+preds = dim(sim1)[1]
+
+Stage = rep(colnames(sim1)[-1], each=preds)
+Jul.date = rep(sim1[,1], times = length(colnames(sim1)[-1]))
+Counts = c(sim1[,-1])
+
+prediction.df = data.frame(Stage, Jul.date, Counts)
+
+
+p.plot <- ggplot(data=prediction.df, aes(x=Jul.date, y=Counts, group=Stage, colour=Stage)) + 
+         geom_line(size = 1.4) +
+         ylim(c(0, 200)) + xlim(c(175, 275)) +
+         scale_fill_manual(name = "Life Stage", labels = c('eggs', 'first', 'second', 'third', 'fourth', 'fifth', 'adults'))+
+        labs(y = "Bugs per plant", x = "Julian Date") 
+p.plot
+
+p.preds <- ggplot(data=prediction.df, aes(x=Jul.date, y=Counts, group=Stage, colour=Stage)) + geom_line(size = 1.4)+
+          ylim(c(0,90)) + xlim(c(175, 275)) 
+          
+p.preds
+
+```
+
+### sensobol aesthetic mods
+```{r set new plot functions for sensobol}
+#function sandra_plot_scatter alters the graph output of the sensobol function to be more visually pleasing to Sandra
+#run this before running sensobol 
+
+library(ggplot2)
+
+plot_names <- c('B_o' = "\u03BB",
+                'p' = "p",
+                'c_o' = "\u03B3^-1")
+
+axis_titles <- data.frame(
+  variable = c("B_o", "c_o", "p"),
+  axis_title = c("Fold increase in \n apo transmission", "Fold increase in \n apo clearance time", "Probability of \n symbiont acquisition")
+)
+
+
+sandra_plot_scatter = function (data, N, Y, params, method = "point", size = 0.7, 
+  alpha = 0.2) 
+{
+  value <- y <- NULL
+  minY <- min(Y)
+  print(minY)
+  dt <- data.table::data.table(cbind(data, Y))[1:N]
+  colnames(dt)[length(colnames(dt))] <- "y"
+  out <- data.table::melt(dt, measure.vars = params)
+  gg <- ggplot2::ggplot(out, ggplot2::aes(value, y)) + 
+    ggplot2::facet_wrap(~variable, scales = "free_x", labeller = as_labeller(plot_names, default = label_parsed))  + 
+    ggplot2::labs(x = NULL, y = "Area under infection prevalence curve") + 
+    ggplot2::theme_bw() + 
+    ggplot2::theme(panel.grid.major = ggplot2::element_blank(),
+                   panel.spacing = unit(1.25, "lines"), #add more space between panels
+                  panel.grid.minor = ggplot2::element_blank(), legend.background = ggplot2::element_rect(fill = "transparent", 
+                  color = NA), legend.key = ggplot2::element_rect(fill = "transparent", 
+                  color = NA), strip.background = ggplot2::element_rect(fill = "white"), 
+                  strip.text = element_text(size = 14), legend.position = "top",
+                  plot.margin = unit(c(.5,.1,.75,.5), "cm"),
+                  axis.title=element_text(size=14), axis.text = element_text(size = 12)) + 
+    ggplot2::geom_text(data = axis_titles, aes(label = axis_title), size = 4.5, 
+                       x= c(min(dt$B_o) + diff(range(dt$B_o))/2, min(dt$c_o) + diff(range(dt$c_o))/2, min(dt$p) + diff(range(dt$p))/2) ,  #centers x axis labels for individual graphs, variables hardcoded, need to change if using diff ones
+                       y= minY - diff(range(Y))/4, color='black') + # need to change y to the minimal value - some divider x Y's range
+    coord_cartesian(clip="off")
+  if (method == "point") {
+    gg <- gg + ggplot2::geom_point(size = size, alpha = alpha) + 
+      ggplot2::stat_summary_bin(fun = "mean", geom = "point", 
+        colour = "red", size = 1.2)
+  }
+  else if (method == "bin") {
+    gg <- gg +  ggplot2::geom_hex(bins = 35) + scale_fill_viridis_c() + #scale_colour_gradient2(palette = "viridis") +
+      ggplot2::stat_summary_bin(fun = "mean", geom = "line", colour = "red", size = 1.2)
+  }
+  else {
+    stop("Method should be either point or bin")
+  }
+  return(gg)
+}
+
+
+#another mod to graphing defaults 
+
+library(RColorBrewer)
+
+sandra_plot_multiscatter = function (data, N, Y, params, smpl = NULL) 
+{
+    xvar <- yvar <- x <- y <- NULL
+    dt <- data.table::data.table(data)
+    out <- t(utils::combn(params, 2))
+    da <- list()
+    for (i in 1:nrow(out)) {
+        cols <- out[i, ]
+        da[[i]] <- cbind(dt[1:N, .SD, .SDcols = (cols)], cols[1], 
+            cols[2], Y[1:N])
+        data.table::setnames(da[[i]], colnames(da[[i]]), c("xvar", 
+            "yvar", "x", "y", "output"))
+    }
+    output <- data.table::rbindlist(da)
+    if (is.null(smpl) == FALSE) {
+        if (is.numeric(smpl) == FALSE) {
+            stop("smpl should be a number")
+        }
+        else {
+            output <- output[, .SD[sample(.N, min(smpl, .N))], 
+                by = list(x, y)]
+        }
+    }
+    gg <- ggplot2::ggplot(output, ggplot2::aes(xvar, yvar, color = output)) + 
+        ggplot2::geom_point(size = 0.5) + ggplot2::scale_colour_gradientn(colours = grDevices::hcl.colors(7, palette = "viridis")) + 
+        ggplot2::scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) + 
+        ggplot2::scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) + 
+        ggplot2::facet_wrap(x ~ y, scales = "free") + ggplot2::theme_bw() + 
+        ggplot2::labs(x = "", y = "") + ggplot2::theme(panel.grid.major = ggplot2::element_blank(), 
+        panel.grid.minor = ggplot2::element_blank(), legend.background = ggplot2::element_rect(fill = "transparent", 
+            color = NA), legend.key = ggplot2::element_rect(fill = "transparent", 
+            color = NA), strip.background = ggplot2::element_rect(fill = "white"), 
+        legend.position = "top")
+    return(gg)
+}
+
+```
+
+```{r sensobol graphs low transmission setting}
+N <- 2^13
+params <- c( "B_o", "p", "c_o") # Choose your parameters of interest
+matrices <- c("A", "B", "AB", "BA")
+first <- total <- "azzini"
+order <- "second"
+R<-10^3 
+type<-"percent"
+conf<-0.95
+
+mat.low <- sobol_matrices(matrices=matrices, N = N, params = params, order = order)
+
+# Choose their ranges
+mat.low[, "B_o"] <- qunif(mat.low[, "B_o"], 10, 1000)
+mat.low[, "p"] <- qunif(mat.low[, "p"], .9, 1)
+mat.low[, "c_o"] <- qunif(mat.low[, "c_o"], .1, 1)
+
+
+sobol_fxn = function(B_o,p,c_o) { # Runs the model and calculates area under the prevalence curve
+  pars_low["B_o"] = B_o; pars_low["p"] = p; pars_low["c_o"] = c_o;
+  sim.low = lsoda(y = Inits, times=timespan, parms = pars_low, func="derivs", dllname = "Squash_bug_apographs3", initfunc="initmod", maxsteps = 500000)
+  return(list(c(auc_PI = trapz(sim.low[,"time"], sim.low[,"P_I"]), auc_ApoPI = trapz(sim.low[,"time"], sim.low[,"Apo_PI"]), auc_SymPI = trapz(sim.low[,"time"], sim.low[,"Sym_PI"])))) 
+} 
+
+sobol_fxn(B_o = pars_low["B_o"],p = pars_low["p"], c_o = pars_low["c_o"])
+
+sobol_mapply_fxn = function(dt){
+  return(mapply(sobol_fxn, dt[, 1], dt[, 2], dt[, 3])) }
+
+# mat = our inputs
+# result = our model outputs
+result_low = sobol_mapply_fxn(mat.low)
+df.low = as.data.frame(do.call(rbind, result_low))
+full.dt.low = data.table(mat.low, df.low) 
+
+#for inverting the clearance rate 
+mat.low.fin <- mat.low %>%
+  as.data.frame(mat.low) %>%
+  mutate(c_o = (1/c_o))
+
+full.dt.low.fin = data.table(mat.low.fin, df.low)
+
+plot_uncertainty(Y = full.dt.low.fin$auc_PI, N = N) + labs(y = "Mean prevalence", x = "y")
+
+#sensitivity analysis graphs
+
+low.mat <- sandra_plot_scatter(data = mat.low.fin, N = N, Y = full.dt.low.fin$auc_PI, params = params, method = "bin") 
+
+#plots all plant infections
+low.mat
+
+# In labels, top = X, bottom = Y
+sandra_plot_multiscatter(data = mat.low.fin, N = N, Y = df.low$auc_PI, params = params, smpl = 2^13)
+
+ind <- sobol_indices(matrices = matrices, Y = df.low$auc_PI, N = N, params = params, 
+                     first = first, total = total, order = order, boot = TRUE, R = R,
+                     parallel = "no", type = type, conf = conf)
+
+cols <- colnames(ind$results)[1:5]
+ind$results[, (cols):= round(.SD, 3), .SDcols = (cols)]
+ind
+
+toplot.low <- subset(ind$results, parameters=="B_o" | parameters=="c_o" | parameters=="p")
+toplot.low
+
+```
+
+```{r sensobol graphs high transmission}
+#### high transmission parameters####
+Inits = c(OA = 9, E = 0, L1 = 0, L2 = 0, L3 = 0, L4 = 0, L5 = 0, A = 0, L2o = 0, L3o = 0, L4o = 0, L5o = 0, Ao = 0, L2I = 0, L3I = 0, L4I = 0, L5I = 0, AI = 0, L2oI = 0, L3oI = 0, L4oI = 0, L5oI = 0, AoI = 0, P_I = 0, Apo_PI = 0, Sym_PI = 0, OA_PI = 0, OAI = 1)
+
+pars_hi = c(d_A = 1/60, l = 0.05, b = 10, K_E = 250, 
+         d_E = 1/7, m_E = 1/7, # Development rates are rough estimates from Tarik's dataset
+         d_1 = 1/4, m_1 = 1/4, # Mortality rates just correspond to 50% survival through the stages
+         d_2 = 1/4, m_2 = 1/4,
+         d_3 = 1/4, m_3 = 1/4,
+         d_4 = 1/4, m_4 = 1/4,
+         d_5 = 1/16, m_5 = 1/16,
+         
+         p = 0.9,
+         d_2o = 1/4, m_2o = 1/4,
+         d_3o = 1/7, m_3o = 1/7,
+         d_4o = 1/13, m_4o = 1/13,
+         d_5o = 1/17, m_5o = 1/17,
+         d_Ao = 1/60,
+         
+         c = 1/3, B_pb = 0.025,
+         c_o = 1/10, B_bp = 0.1, #note all params are the same as before except for B_bp
+         B_o = 20, P0 = 1
+         )
+timespan = 180:270
+
+sim.hi = lsoda(y = Inits, times=timespan, parms = pars_hi, func="derivs", dllname = "Squash_bug_apographs3", initfunc="initmod")
+
+
+N <- 2^13
+params <- c( "B_o", "p", "c_o") # Choose your parameters of interest
+matrices <- c("A", "B", "AB", "BA")
+first <- total <- "azzini"
+order <- "second"
+R<-10^3 
+type<-"percent"
+conf<-0.95
+
+mat.hi <- sobol_matrices(matrices=matrices, N = N, params = params, order = order)
+
+# Choose their ranges
+mat.hi[, "B_o"] <- qunif(mat.hi[, "B_o"], 10, 1000)
+mat.hi[, "p"] <- qunif(mat.hi[, "p"], .9, 1)
+mat.hi[, "c_o"] <- qunif(mat.hi[, "c_o"], 1/10, 1)
+
+
+sobol_fxn_hi = function(B_o,p,c_o) { # Runs the model and calculates area under the prevalence curve
+  pars_hi["B_o"] = B_o; pars_hi["p"] = p; pars_hi["c_o"] = c_o;
+  sim.hi = lsoda(y = Inits, times=timespan, parms = pars_hi, func="derivs", dllname = "Squash_bug_apographs3", initfunc="initmod", maxsteps = 500000)
+  return(list(c(auc_PI = trapz(sim.hi[,"time"], sim.hi[,"P_I"]), auc_ApoPI = trapz(sim.hi[,"time"], sim.hi[,"Apo_PI"]), auc_SymPI = trapz(sim.hi[,"time"], sim.hi[,"Sym_PI"])))) 
+} 
+
+sobol_fxn_hi(B_o = pars_hi["B_o"],p = pars_hi["p"], c_o = pars_hi["c_o"])
+
+sobol_mapply_fxn_hi = function(dt){
+  return(mapply(sobol_fxn_hi, dt[, 1], dt[, 2], dt[, 3])) 
+  
+}
+
+# mat = our inputs
+# result = our model outputs
+result_hi = sobol_mapply_fxn_hi(mat.hi)
+df.hi = as.data.frame(do.call(rbind, result_hi))
+full.dt.hi = data.table(mat.hi, df.hi) 
+
+####for inverting the clearance rate  ####
+mat.hi.fin <- mat.hi %>%
+  as.data.frame(mat.hi) %>%
+  mutate(c_o = (1/c_o))
+
+full.dt.hi.fin = data.table(mat.hi.fin, df.hi)
+
+#### plots ####
+plot_uncertainty(Y = full.dt.hi.fin$auc_PI, N = N) + labs(y = "Mean prevalence", x = "y")
+
+hi.mat <- sandra_plot_scatter(data = mat.hi.fin, N = N, Y = full.dt.hi.fin$auc_PI, params = params, method = "bin") #plots all plant infections
+hi.mat
+
+# In labels, top = X, bottom = Y
+sandra_plot_multiscatter(data = mat.hi.fin, N = N, Y = df.hi$auc_PI, params = params, smpl = 2^13)
+
+ind.hi <- sobol_indices(matrices = matrices, Y = df.hi$auc_PI, N = N, params = params, 
+                     first = first, total = total, order = order, boot = TRUE, R = R,
+                     parallel = "no", type = type, conf = conf)
+
+cols <- colnames(ind.hi$results)[1:5]
+ind.hi$results[, (cols):= round(.SD, 3), .SDcols = (cols)]
+ind.hi
+
+toplot.hi <- subset(ind.hi$results, parameters=="B_o" | parameters=="c_o" | parameters=="p")
+toplot.hi
+
+```
+
+```{r sobol indices graphs}
+#look at plots
+plot(ind.hi)
+plot(ind)
+
+#make plots nicer
+ind.low <- ggplot(toplot.low, aes(x=parameters, y=original, fill=sensitivity)) + 
+  geom_bar(stat="identity", color="black", position=position_dodge()) +
+  scale_fill_manual(name = "Effects", labels = c("Individual", "Total"), values=c("grey",
+                             "gray42")) +
+  geom_linerange(aes(ymin=original-std.error, ymax=original+std.error), linewidth= 1.5,
+                 position=position_dodge(.9)) +
+   theme(legend.position = "top", legend.justification = "center") +
+  scale_y_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_x_discrete(labels=c("Apo Transmission \n Rate", "Apo Clearance \n Rate", "Probability of \n Symbiont Acquisition")) +
+  labs(y = "Index Value", x = "")
+
+ind.low
+
+ind.hi <- ggplot(toplot.hi, aes(x=parameters, y=original, fill=sensitivity)) + 
+  geom_bar(stat="identity", color="black", position=position_dodge()) +
+  scale_fill_manual(name = "Effects", labels = c("Individual", "Total"), values=c("grey",
+                             "gray42")) +
+  geom_linerange(aes(ymin=original-std.error, ymax=original+std.error), linewidth= 1.5,
+                 position=position_dodge(.9)) +
+  theme(legend.position = "top", legend.justification = "center") +
+  scale_y_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_x_discrete(labels=c("Apo Transmission \n Rate", "Apo Clearance \n Rate", "Probability of \n Symbiont Acquisition")) +
+  labs(y = "Index Value", x = "")
+
+ind.hi
+```
+
+##putting all graphs together
+```{r fig.height = 11, fig.width=16}
+
+fig <- plot_grid(NULL, low.mat, NULL, ind.low, NULL, NULL, NULL, NULL, NULL, hi.mat, NULL, ind.hi, 
+                 labels = c('', 'A', '', 'B', '', '', '', '', '', 'C', '', 'D'), label_size = 20, axis = "tlbr",
+  align = 'vh', nrow = 4, ncol = 4, rel_widths = c(.09, 1.35, .1, 1), rel_heights= c(1, .05, 1, .05), 
+  scale = c(1, 1, 1, 1.1, 1, 1, 1, 1.1)) 
+fig + annotate("text", x = .0125, y = .75, angle = "90", size = 9.5, fontface = "bold", label = "Low Transmission") + annotate("text", x = .0125, y = .25, angle = "90", size = 9.5, fontface = "bold", label = "High Transmission")
+
+#save figure 
+tiff(file="sensobol_fig3.tiff",width=18, height=12, units="in", res=300)
+fig + annotate("text", x = .0125, y = .75, angle = "90", size = 9.5, fontface = "bold", label = "Low Transmission") + annotate("text", x = .0125, y = .25, angle = "90", size = 9.5, fontface = "bold", label = "High Transmission")
+dev.off()
+
+```
+
